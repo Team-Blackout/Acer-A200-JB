@@ -34,11 +34,28 @@
 extern int p2_wakeup;
 #endif
 
+#if defined(CONFIG_ARCH_ACER_T20)
+#include <asm/atomic.h>
+#include "../../../arch/arm/mach-tegra/board-acer-t20.h"
+
+extern int is3Gwakeup(void);
+extern int get_sku_id(void);
+static atomic_t wakeup_flag = ATOMIC_INIT(0);
+static int wakeup_resume_flag = -1;
+static int is_3g_sku = 0;
+#define TEGRA_GPIO_PC7 23
+#define TEGRA_GPIO_PI3 67
+static int wakeup_gpio = TEGRA_GPIO_PC7;
+#endif
+
 struct gpio_button_data {
 	struct gpio_keys_button *button;
 	struct input_dev *input;
 	struct timer_list timer;
 	struct work_struct work;
+#ifdef CONFIG_VIDEO_LTC3216
+	struct timer_list ltc3216_timer;
+#endif
 	int timer_debounce;	/* in msecs */
 	bool disabled;
 };
@@ -51,6 +68,10 @@ struct gpio_keys_drvdata {
 	void (*disable)(struct device *dev);
 	struct gpio_button_data data[0];
 };
+
+#ifdef CONFIG_VIDEO_LTC3216
+extern void ltc3216_turn_off_torch(void);
+#endif
 
 /*
  * SYSFS interface for enabling/disabling keys and switches:
@@ -280,6 +301,25 @@ ATTR_SHOW_FN(disabled_switches, EV_SW, true);
 static DEVICE_ATTR(keys, S_IRUGO, gpio_keys_show_keys, NULL);
 static DEVICE_ATTR(switches, S_IRUGO, gpio_keys_show_switches, NULL);
 
+#if defined(CONFIG_ARCH_ACER_T20)
+#ifdef CONFIG_DOCK_V1
+static ssize_t gpio_keys_powerkey(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct gpio_keys_drvdata *ddata = platform_get_drvdata(pdev);
+	struct input_dev *input = ddata->input;
+
+	input_report_key( input, KEY_POWER, 1);
+	input_sync( input );
+	input_report_key( input, KEY_POWER, 0);
+	input_sync( input );
+
+	return 0;
+}
+static DEVICE_ATTR(powerkey, S_IRUGO | S_IWUSR , gpio_keys_powerkey, gpio_keys_powerkey);
+#endif
+#endif
+
 #define ATTR_STORE_FN(name, type)					\
 static ssize_t gpio_keys_store_##name(struct device *dev,		\
 				      struct device_attribute *attr,	\
@@ -318,6 +358,11 @@ static struct attribute *gpio_keys_attrs[] = {
 	&dev_attr_switches.attr,
 	&dev_attr_disabled_keys.attr,
 	&dev_attr_disabled_switches.attr,
+#if defined(CONFIG_ARCH_ACER_T20)
+#ifdef CONFIG_DOCK_V1
+	&dev_attr_powerkey.attr,
+#endif
+#endif
 	NULL,
 };
 
@@ -347,6 +392,16 @@ static void gpio_keys_report_event(struct gpio_button_data *bdata)
 #if defined(CONFIG_ARCH_ACER_T20)
 	pr_info("%s: button->code = %d, state = %d\n", __func__, button->code, !!state);
 #endif
+
+#ifdef CONFIG_VIDEO_LTC3216
+	if (button->code == 116 /* KEY_POWER */ ) {
+		if (state)
+			mod_timer(&bdata->ltc3216_timer, jiffies + msecs_to_jiffies(4000));
+		else
+			del_timer(&bdata->ltc3216_timer);
+	}
+#endif
+
 	input_event(input, type, button->code, !!state);
 	input_sync(input);
 }
@@ -356,7 +411,22 @@ static void gpio_keys_work_func(struct work_struct *work)
 	struct gpio_button_data *bdata =
 		container_of(work, struct gpio_button_data, work);
 
+#if defined(CONFIG_ARCH_ACER_T20)
+	if (is_3g_sku && (bdata->button->gpio == TEGRA_GPIO_PC7)) {
+		if (atomic_read(&wakeup_flag) == 0) {
+			atomic_set(&wakeup_flag, 1);
+			if (!is3Gwakeup()) {
+				printk(KERN_INFO "%s: first time report gpio_keys_report_event\n", __func__);
+				wakeup_resume_flag = 1;
+				gpio_keys_report_event(bdata);
+			} else
+				printk(KERN_INFO "%s: first time SKIP gpio_keys_report_event\n", __func__);
+		}
+	} else
+		gpio_keys_report_event(bdata);
+#else
 	gpio_keys_report_event(bdata);
+#endif
 }
 
 static void gpio_keys_timer(unsigned long _data)
@@ -365,6 +435,16 @@ static void gpio_keys_timer(unsigned long _data)
 
 	schedule_work(&data->work);
 }
+
+#ifdef CONFIG_VIDEO_LTC3216
+static void ltc3216_timer_func(unsigned long _data)
+{
+	struct gpio_button_data *data = (struct gpio_button_data *)_data;
+	int state = gpio_get_value(data->button->gpio) ? 1 : 0;
+	if (state)
+		ltc3216_turn_off_torch();
+}
+#endif
 
 static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
 {
@@ -382,6 +462,10 @@ static irqreturn_t gpio_keys_isr(int irq, void *dev_id)
 	else
 		schedule_work(&bdata->work);
 
+#if defined(CONFIG_ARCH_ACER_T20)
+	wakeup_gpio = button->gpio;
+#endif
+
 	return IRQ_HANDLED;
 }
 
@@ -396,6 +480,10 @@ static int __devinit gpio_keys_setup_key(struct platform_device *pdev,
 
 	setup_timer(&bdata->timer, gpio_keys_timer, (unsigned long)bdata);
 	INIT_WORK(&bdata->work, gpio_keys_work_func);
+
+#ifdef CONFIG_VIDEO_LTC3216
+	setup_timer(&bdata->ltc3216_timer, ltc3216_timer_func, (unsigned long)bdata);
+#endif
 
 	error = gpio_request(button->gpio, desc);
 	if (error < 0) {
@@ -548,6 +636,12 @@ static int __devinit gpio_keys_probe(struct platform_device *pdev)
 
 	device_init_wakeup(&pdev->dev, wakeup);
 
+#if defined(CONFIG_ARCH_ACER_T20)
+	if (get_sku_id() == BOARD_PICASSO_3G || get_sku_id() == BOARD_VANGOGH_3G) {
+		is_3g_sku = 1;
+	}
+#endif
+
 	return 0;
 
  fail3:
@@ -602,6 +696,11 @@ static int gpio_keys_suspend(struct device *dev)
 	struct gpio_keys_platform_data *pdata = pdev->dev.platform_data;
 	int i;
 
+#if defined(CONFIG_ARCH_ACER_T20)
+	atomic_set(&wakeup_flag, 0);
+	wakeup_resume_flag = -1;
+#endif
+
 	if (device_may_wakeup(&pdev->dev)) {
 		for (i = 0; i < pdata->nbuttons; i++) {
 			struct gpio_keys_button *button = &pdata->buttons[i];
@@ -625,6 +724,10 @@ static int gpio_keys_resume(struct device *dev)
 
 #if defined(CONFIG_ARCH_ACER_T20)
 	pr_info("%s\n", __func__);
+
+	if (wakeup_resume_flag == -1)
+		if (!is_3g_sku || !is3Gwakeup())
+			wakeup_resume_flag = 1;
 #endif
 
 	if (pdata->wakeup_key)
@@ -642,14 +745,31 @@ static int gpio_keys_resume(struct device *dev)
 
 #if defined(CONFIG_ARCH_ACER_T20)
 				pr_info("%s: wakeup_key is pressed\n", __func__);
-#endif
+
+				if (wakeup_resume_flag == 1) {
+					input_event(ddata->input, type, button->code, 1);
+					input_event(ddata->input, type, button->code, 0);
+					input_sync(ddata->input);
+				}
+#else
 				input_event(ddata->input, type, button->code, 1);
 				input_event(ddata->input, type, button->code, 0);
 				input_sync(ddata->input);
+#endif
 			}
 		}
+#if defined(CONFIG_ARCH_ACER_T20)
+		if (wakeup_resume_flag == 1)
+			gpio_keys_report_event(&ddata->data[i]);
+		else
+			printk(KERN_INFO "%s: SKIP gpio_keys_report_event, waken up by 3G\n", __func__);
+#else
 		gpio_keys_report_event(&ddata->data[i]);
+#endif
 	}
+#if defined(CONFIG_ARCH_ACER_T20)
+	wakeup_resume_flag = -1;
+#endif
 	input_sync(ddata->input);
 
 	return 0;

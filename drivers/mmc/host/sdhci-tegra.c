@@ -46,8 +46,13 @@
 #define SDMMC_AUTO_CAL_CONFIG_AUTO_CAL_PU_OFFSET	0x62
 
 #define SDHOST_1V8_OCR_MASK	0x8
+#if defined(CONFIG_ARCH_ACER_T30)
+#define SDHOST_HIGH_VOLT_MIN	3300000
+#define SDHOST_HIGH_VOLT_MAX	3300000
+#else
 #define SDHOST_HIGH_VOLT_MIN	2700000
 #define SDHOST_HIGH_VOLT_MAX	3600000
+#endif
 #define SDHOST_LOW_VOLT_MIN	1800000
 #define SDHOST_LOW_VOLT_MAX	1800000
 
@@ -725,7 +730,7 @@ static int tegra_sdhci_pltfm_init(struct sdhci_host *host,
 	tegra_host->max_clk_limit = plat->max_clk_limit;
 	tegra_host->instance = pdev->id;
 
-	host->mmc->caps |= MMC_CAP_ERASE;
+	//host->mmc->caps |= MMC_CAP_ERASE;
 	host->mmc->caps |= MMC_CAP_DISABLE;
 	/* enable 1/8V DDR capable */
 	host->mmc->caps |= MMC_CAP_1_8V_DDR;
